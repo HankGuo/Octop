@@ -3232,3 +3232,81 @@ async def test_restore_respects_runtime_capability_and_expert_scope(
     finally:
         for row in rows:
             await manager.stop(row.agent_id)
+
+
+def test_resolve_fallback_model_ref_respects_group_access(manager: AgentManager) -> None:
+    from octop.infra.agents.middleware.model_failover import SafeModelFailoverMiddleware
+    from octop.infra.users.groups import RESOURCE_MODEL, GroupAccess
+
+    allowed_user = manager._repos.user_repo.create(username="zhipu-user", role="user")
+    outsider = manager._repos.user_repo.create(username="no-models", role="user")
+    group_a = manager._repos.user_group_repo.create(name="only-deepseek", description=None)
+    group_b = manager._repos.user_group_repo.create(name="only-zhipu", description=None)
+    manager._repos.user_group_member_repo.add(group_b.user_group_id, allowed_user)
+
+    manager._repos.provider_repo.create(
+        name="deepseek",
+        kind="openai",
+        base_url="https://api.example.com/v1",
+        api_key="sk-a",
+        models_json=json.dumps(
+            [
+                {"id": "deepseek-chat", "enabled": True},
+                {"id": "deepseek-vl", "input": ["text", "image"], "enabled": True},
+            ]
+        ),
+    )
+    manager._repos.provider_repo.create(
+        name="zhipu",
+        kind="openai",
+        base_url="https://api.example.com/v1",
+        api_key="sk-b",
+        models_json=json.dumps(
+            [
+                {"id": "glm-4", "enabled": True},
+                {"id": "glm-4v", "input": ["text", "image"], "enabled": True},
+            ]
+        ),
+    )
+    manager._repos.settings_repo.set_active_model("deepseek", "deepseek-chat")
+    access = GroupAccess(manager._repos)
+    access.set_visibility(
+        RESOURCE_MODEL, "deepseek/deepseek-chat", "groups", [group_a.user_group_id]
+    )
+    access.set_visibility(RESOURCE_MODEL, "deepseek/deepseek-vl", "groups", [group_a.user_group_id])
+    access.set_visibility(RESOURCE_MODEL, "zhipu/glm-4", "groups", [group_b.user_group_id])
+    access.set_visibility(RESOURCE_MODEL, "zhipu/glm-4v", "groups", [group_b.user_group_id])
+
+    assert manager.resolve_fallback_model_ref(user_id=allowed_user) == "zhipu/glm-4"
+    assert (
+        manager.resolve_fallback_model_ref(user_id=allowed_user, needs_multimodal=True)
+        == "zhipu/glm-4v"
+    )
+    assert manager.resolve_fallback_model_ref(user_id=outsider) is None
+
+    factory = MagicMock()
+    factory.get_chat_model.return_value = object()
+    manager._harness_manager = MagicMock(shared_factory=factory)
+    owner_row = AgentRow(
+        id=2,
+        agent_id="01OWN",
+        user_id=allowed_user,
+        name="owner-bot",
+        description=None,
+        persona_mbti=None,
+        default_model=None,
+        system_prompt=None,
+        enabled=1,
+        config_json=None,
+        last_state=None,
+        last_error=None,
+        created_at=0,
+        updated_at=0,
+    )
+    cfg = manager._build_harness_config(owner_row)
+    assert cfg.default_model == "zhipu/glm-4"
+    failovers = [m for m in (cfg.middleware or []) if isinstance(m, SafeModelFailoverMiddleware)]
+    assert len(failovers) == 1
+    assert failovers[0]._is_candidate_allowed is not None
+    assert failovers[0]._is_candidate_allowed(allowed_user, "deepseek/deepseek-chat") is False
+    assert failovers[0]._is_candidate_allowed(allowed_user, "zhipu/glm-4") is True

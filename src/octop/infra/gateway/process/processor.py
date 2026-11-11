@@ -32,7 +32,7 @@ from octop.infra.agents.teams.team_manager import (
 from octop.infra.agents.teams.team_manager import (
     stamp_team_host_chunk as _maybe_stamp_team_host,
 )
-from octop.infra.errors import OctopError
+from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.gateway.cli.events import message_event_to_cli_chunks
 from octop.infra.gateway.hitl.coordinator import (
     HitlAnswerOutcome,
@@ -753,11 +753,11 @@ class GlobalProcessor:
     ) -> _ResolvedModelRoute:
         """Per-turn ``model`` for harness requests.
 
-        - Expert AUTO (no ``default_model`` on row): omit ``model`` → harness routes.
+        - Expert AUTO (no ``default_model`` on row): pick a permitted auto route.
         - Expert default set: pass default (or slash/thread / dashboard override).
-        - Stale overrides (deleted / disabled catalog refs) are dropped so routing
-          falls through to a usable expert default or harness AUTO.
-        - When a model is passed and the turn needs vision, upgrade to a vision ref.
+        - Stale or restricted overrides are dropped so routing falls back to a
+          permitted candidate, failing closed when usable models exist without access.
+        - When a model is passed and the turn needs vision, upgrade to a permitted vision ref.
         """
         providers = self._agent_manager.providers
         thread_model = self._agent_manager.get_thread_model(agent_id, thread_id)
@@ -768,10 +768,12 @@ class GlobalProcessor:
             thread_row.model_ref if thread_row is not None else None,
         )
         automatic = False
+        denied_by_access = False
         if model_ref and not providers.is_model_ref_usable(model_ref):
             model_ref = None
         if model_ref and not self._agent_manager.model_ref_allowed_for_user(user_id, model_ref):
             model_ref = None
+            denied_by_access = True
         if not model_ref:
             row = self._agent_repo.get(agent_id)
             if row is not None:
@@ -784,30 +786,68 @@ class GlobalProcessor:
                     model_ref,
                 ):
                     model_ref = None
+                    denied_by_access = True
         if not model_ref:
             user_row = self._user_repo.get(user_id)
             preferred = get_preferred_model_from_json(
                 user_row.preferences_json if user_row is not None else None
             )
-            if (
-                preferred
-                and self._agent_manager.is_auto_route_model_available(preferred)
-                and self._agent_manager.model_ref_allowed_for_user(user_id, preferred)
-            ):
-                model_ref = preferred
-                automatic = True
+            if preferred and self._agent_manager.is_auto_route_model_available(preferred):
+                if self._agent_manager.model_ref_allowed_for_user(user_id, preferred):
+                    model_ref = preferred
+                    automatic = True
+                else:
+                    denied_by_access = True
         if not model_ref:
-            fallback = self._agent_manager.resolve_fallback_model_ref()
+            fallback = self._agent_manager.resolve_fallback_model_ref(
+                user_id=user_id,
+                needs_multimodal=needs_multimodal,
+            )
             candidate = fallback.strip() if isinstance(fallback, str) and fallback.strip() else None
-            if candidate and self._agent_manager.model_ref_allowed_for_user(user_id, candidate):
-                model_ref = candidate
-                automatic = True
+            if candidate:
+                if self._agent_manager.model_ref_allowed_for_user(user_id, candidate):
+                    model_ref = candidate
+                    automatic = True
+                else:
+                    denied_by_access = True
         if not model_ref:
+            candidates = providers.list_auto_route_candidates(needs_multimodal=False)
+            has_usable = isinstance(candidates, list) and bool(candidates)
+            if denied_by_access or (
+                has_usable
+                and not any(
+                    self._agent_manager.model_ref_allowed_for_user(user_id, c.ref)
+                    for c in candidates
+                )
+            ):
+                raise OctopError(
+                    ErrorCode.RESOURCE_NOT_ALLOWED,
+                    "resource is not visible to this user",
+                )
             return _ResolvedModelRoute(None, automatic=True)
         resolved = providers.resolve_model_for_multimodal_turn(
             model_ref,
             needs_multimodal=needs_multimodal,
         )
+        if (
+            isinstance(resolved, str)
+            and resolved
+            and resolved != model_ref
+            and not self._agent_manager.model_ref_allowed_for_user(user_id, resolved)
+        ):
+            vision_candidates = providers.list_auto_route_candidates(needs_multimodal=True)
+            permitted_vision = next(
+                (
+                    candidate.ref
+                    for candidate in (
+                        vision_candidates if isinstance(vision_candidates, list) else ()
+                    )
+                    if self._agent_manager.is_auto_route_model_available(candidate.ref)
+                    and self._agent_manager.model_ref_allowed_for_user(user_id, candidate.ref)
+                ),
+                None,
+            )
+            resolved = permitted_vision or model_ref
         if resolved != model_ref:
             automatic = True
         return _ResolvedModelRoute(resolved, automatic=automatic)
@@ -988,13 +1028,24 @@ class GlobalProcessor:
             media_backend=media_backend,
             locale=locale,
         )
-        model_route = self._resolve_harness_model_route(
-            agent_id,
-            thread_id,
-            None,
-            user_id=user_id,
-            needs_multimodal=content_blocks_need_vision(content),
-        )
+        try:
+            model_route = self._resolve_harness_model_route(
+                agent_id,
+                thread_id,
+                None,
+                user_id=user_id,
+                needs_multimodal=content_blocks_need_vision(content),
+            )
+        except OctopError as exc:
+            await self._record_stream_error(
+                user_id=user_id, agent_id=agent_id, thread_id=thread_id, exc=exc
+            )
+            message, error_code = _stream_error(exc, locale)
+            if error_code:
+                message = f"[{error_code}] {message}"
+            yield MessageEvent.error_event(message)
+            yield MessageEvent.completed()
+            return
         model_ref = model_route.model_ref
         reasoning_overrides = self._resolve_reasoning_overrides(
             user_id=user_id,

@@ -46,6 +46,10 @@ def model_resource_key(provider_name: str, model_id: str) -> str:
     return f"{provider_name}/{model_id}"
 
 
+def _normalize_model_key(resource_key: str) -> str:
+    return resource_key.strip().casefold()
+
+
 def model_ref_allowed(
     repos: Any,
     *,
@@ -77,15 +81,20 @@ def group_visibility_sql(resource_type: str, key_expr: str) -> str:
     """
     if resource_type not in RESOURCE_TYPES:
         raise ValueError(f"unknown resource type {resource_type!r}")
+    key_match = (
+        f"LOWER(g.resource_key) = LOWER({key_expr})"
+        if resource_type == RESOURCE_MODEL
+        else f"g.resource_key = {key_expr}"
+    )
     return (
         "NOT EXISTS ("
         " SELECT 1 FROM resource_group_grant g"
-        f" WHERE g.resource_type = '{resource_type}' AND g.resource_key = {key_expr}"
+        f" WHERE g.resource_type = '{resource_type}' AND {key_match}"
         ") OR EXISTS ("
         " SELECT 1 FROM resource_group_grant g"
         " JOIN user_group_member m ON m.user_group_id = g.user_group_id"
         " JOIN user_group ug ON ug.user_group_id = g.user_group_id AND ug.enabled = 1"
-        f" WHERE g.resource_type = '{resource_type}' AND g.resource_key = {key_expr}"
+        f" WHERE g.resource_type = '{resource_type}' AND {key_match}"
         " AND m.user_id = ?"
         ")"
     )
@@ -99,6 +108,37 @@ class GroupAccess:
         self._members = repos.user_group_member_repo
         self._grants = repos.resource_group_grant_repo
 
+    def _resource_grant_ids(self, resource_type: str, resource_key: str) -> set[str]:
+        """Look up granted group ids, folding case for ``RESOURCE_MODEL`` keys."""
+        if resource_type != RESOURCE_MODEL:
+            ids: set[str] = self._grants.group_ids(resource_type, resource_key)
+            return ids
+        normalized = _normalize_model_key(resource_key)
+        if not normalized:
+            return set()
+        by_resource = self._grants.group_ids_by_resource(resource_type)
+        if isinstance(by_resource, dict):
+            matched: set[str] = set()
+            for key, group_ids in by_resource.items():
+                if _normalize_model_key(key) == normalized:
+                    matched.update(group_ids)
+            return matched
+        fallback_ids: set[str] = self._grants.group_ids(resource_type, resource_key)
+        return fallback_ids
+
+    def _delete_model_variants(self, resource_key: str) -> None:
+        normalized = _normalize_model_key(resource_key)
+        by_resource = self._grants.group_ids_by_resource(RESOURCE_MODEL)
+        if not isinstance(by_resource, dict):
+            self._grants.delete_resource(RESOURCE_MODEL, resource_key)
+            return
+        variants = [key for key in by_resource if _normalize_model_key(key) == normalized]
+        if not variants:
+            self._grants.delete_resource(RESOURCE_MODEL, resource_key)
+            return
+        for key in variants:
+            self._grants.delete_resource(RESOURCE_MODEL, key)
+
     def allows(
         self,
         *,
@@ -110,7 +150,7 @@ class GroupAccess:
     ) -> bool:
         if is_admin or is_owner:
             return True
-        granted = self._grants.group_ids(resource_type, resource_key)
+        granted = self._resource_grant_ids(resource_type, resource_key)
         if not granted:
             return True
         active = granted & self._enabled_group_ids()
@@ -152,6 +192,11 @@ class GroupAccess:
         granted_by_key = self._grants.group_ids_by_resource(resource_type)
         if not granted_by_key:
             return list(rows)
+        if resource_type == RESOURCE_MODEL:
+            folded: dict[str, set[str]] = {}
+            for key, group_ids in granted_by_key.items():
+                folded.setdefault(_normalize_model_key(key), set()).update(group_ids)
+            granted_by_key = folded
         enabled = self._enabled_group_ids()
         member_groups = self._members.group_ids_for_user(user_id)
         kept: list[T] = []
@@ -159,7 +204,12 @@ class GroupAccess:
             if is_owner(row):
                 kept.append(row)
                 continue
-            granted = granted_by_key.get(key_of(row))
+            lookup_key = (
+                _normalize_model_key(key_of(row))
+                if resource_type == RESOURCE_MODEL
+                else key_of(row)
+            )
+            granted = granted_by_key.get(lookup_key)
             if not granted:
                 kept.append(row)
                 continue
@@ -181,7 +231,7 @@ class GroupAccess:
         """
         if shared is False:
             return {"visibility": VISIBILITY_OWNER, "group_ids": []}
-        group_ids = sorted(self._grants.group_ids(resource_type, resource_key))
+        group_ids = sorted(self._resource_grant_ids(resource_type, resource_key))
         if not group_ids:
             return {"visibility": VISIBILITY_ALL, "group_ids": []}
         return {"visibility": VISIBILITY_GROUPS, "group_ids": group_ids}
@@ -231,11 +281,19 @@ class GroupAccess:
             raise OctopError(ErrorCode.FORBIDDEN, "unknown resource type", status=400)
         cleaned = self.validate_visibility(visibility, group_ids)
         if visibility in {VISIBILITY_ALL, VISIBILITY_OWNER}:
-            self._grants.delete_resource(resource_type, resource_key)
+            if resource_type == RESOURCE_MODEL:
+                self._delete_model_variants(resource_key)
+            else:
+                self._grants.delete_resource(resource_type, resource_key)
             return
+        if resource_type == RESOURCE_MODEL:
+            self._delete_model_variants(resource_key)
         self._grants.replace(resource_type, resource_key, cleaned)
 
     def clear(self, resource_type: str, resource_key: str) -> None:
+        if resource_type == RESOURCE_MODEL:
+            self._delete_model_variants(resource_key)
+            return
         self._grants.delete_resource(resource_type, resource_key)
 
 
@@ -371,7 +429,12 @@ def group_access_by_group(repos: Any) -> dict[str, dict[str, Any]]:
             key: group_ids for (kind, key), group_ids in grants.items() if kind == resource_type
         }
 
-    model_grants = keys(RESOURCE_MODEL)
+    raw_model_grants = keys(RESOURCE_MODEL)
+    canonical_models = {_normalize_model_key(key): key for key in model_labels}
+    model_grants: dict[str, set[str]] = {}
+    for key, group_ids in raw_model_grants.items():
+        target = canonical_models.get(_normalize_model_key(key), key)
+        model_grants.setdefault(target, set()).update(group_ids)
     package_grants = keys(RESOURCE_SKILL_PACKAGE)
     base_grants = keys(RESOURCE_KNOWLEDGE_BASE)
     connector_grants = keys(RESOURCE_CONNECTOR)

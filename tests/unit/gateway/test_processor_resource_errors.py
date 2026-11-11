@@ -72,6 +72,14 @@ def test_stream_error_preserves_resource_error_code() -> None:
     assert "12/10" in message
 
 
+def test_format_stream_error_localizes_octop_error() -> None:
+    from octop.i18n.domains.stream import format_stream_error
+
+    err = OctopError(ErrorCode.RESOURCE_NOT_ALLOWED, "resource is not visible to this user")
+    assert format_stream_error(err, "zh") == err.localized_message("zh")
+    assert format_stream_error(err, "en") == err.localized_message("en")
+
+
 def _processor_with_stream(
     stream: Callable[..., AsyncIterator[dict[str, Any]]],
 ) -> tuple[GlobalProcessor, InboundMessage, list[list[Any]]]:

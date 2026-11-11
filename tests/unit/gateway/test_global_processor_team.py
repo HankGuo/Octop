@@ -2341,3 +2341,157 @@ def test_stamp_stream_speaker_sets_agent_alias() -> None:
     )
     assert member["agent_id"] == "doctor"
     assert member["agent"] == "doctor"
+
+
+@pytest.mark.asyncio
+async def test_auto_route_respects_model_group_access_and_fails_closed(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    from octop_gateway.models import ChannelSubject, InboundMessage, TextContent
+
+    from octop.config import OctopConfig
+    from octop.infra.agents.manager import AgentManager
+    from octop.infra.db.services import build_shared_services
+    from octop.infra.errors import ErrorCode, OctopError
+    from octop.infra.users.groups import RESOURCE_MODEL, GroupAccess
+    from octop.infra.utils.paths import PathLayout
+
+    paths = PathLayout(tmp_path / ".octop")
+    paths.ensure_root()
+    db = SqlitePool(paths.db)
+    run_migrations(db)
+    services = build_shared_services(db=db, paths=paths, config=OctopConfig())
+    repos = services.repos
+
+    repos.user_repo.create(username="admin", role="admin")
+    allowed_user = repos.user_repo.create(username="zhipu-only", role="user")
+    outsider = repos.user_repo.create(username="outsider", role="user")
+    repos.user_repo.set_preferences_json(
+        allowed_user,
+        json.dumps({"preferred_model": "deepseek/deepseek-chat"}),
+    )
+
+    group_a = repos.user_group_repo.create(name="ds-group", description=None)
+    group_b = repos.user_group_repo.create(name="zp-group", description=None)
+    repos.user_group_member_repo.add(group_b.user_group_id, allowed_user)
+
+    repos.provider_repo.create(
+        name="deepseek",
+        kind="openai",
+        base_url="https://api.example.com/v1",
+        api_key="sk-ds",
+        models_json=json.dumps(
+            [
+                {"id": "deepseek-chat", "enabled": True},
+                {"id": "deepseek-vl", "input": ["text", "image"], "enabled": True},
+            ]
+        ),
+    )
+    repos.provider_repo.create(
+        name="zhipu",
+        kind="openai",
+        base_url="https://api.example.com/v1",
+        api_key="sk-zp",
+        models_json=json.dumps([{"id": "glm-4", "enabled": True}]),
+    )
+    repos.settings_repo.set_active_model("deepseek", "deepseek-chat")
+    access = GroupAccess(repos)
+    access.set_visibility(
+        RESOURCE_MODEL, "deepseek/deepseek-chat", "groups", [group_a.user_group_id]
+    )
+    access.set_visibility(RESOURCE_MODEL, "deepseek/deepseek-vl", "groups", [group_a.user_group_id])
+    access.set_visibility(RESOURCE_MODEL, "zhipu/glm-4", "groups", [group_b.user_group_id])
+
+    repos.agent_repo.create(agent_id="shared-auto", user_id=1, name="Shared AUTO")
+    repos.agent_repo.set_shared("shared-auto", True)
+    manager = AgentManager(repos=repos, paths=paths)
+    registry = ThreadRegistry(session_repo=repos.session_repo, thread_repo=repos.thread_repo)
+    processor = GlobalProcessor(
+        agent_manager=manager,
+        thread_registry=registry,
+        audit_repo=repos.audit_repo,
+        agent_repo=repos.agent_repo,
+        user_repo=repos.user_repo,
+        connector_repo=repos.connector_repo,
+        dispatcher=SlashDispatcher(),
+    )
+
+    route = processor._resolve_harness_model_route(
+        "shared-auto",
+        "thr-allowed",
+        None,
+        needs_multimodal=False,
+        user_id=allowed_user,
+    )
+    assert route.model_ref == "zhipu/glm-4"
+    assert route.automatic is True
+
+    # Vision turn without a permitted vision model stays on permitted text model,
+    # never upgrading to deepseek/deepseek-vl.
+    vision_route = processor._resolve_harness_model_route(
+        "shared-auto",
+        "thr-allowed",
+        {"model": "zhipu/glm-4"},
+        needs_multimodal=True,
+        user_id=allowed_user,
+    )
+    assert vision_route.model_ref == "zhipu/glm-4"
+
+    # Adding a permitted vision model lets upgrade pick only the permitted one.
+    zp_row = repos.provider_repo.get_by_name("zhipu")
+    assert zp_row is not None
+    repos.provider_repo.update(
+        zp_row.id,
+        models_json=json.dumps(
+            [
+                {"id": "glm-4", "enabled": True},
+                {"id": "glm-4v", "input": ["text", "image"], "enabled": True},
+            ]
+        ),
+    )
+    access.set_visibility(RESOURCE_MODEL, "zhipu/glm-4v", "groups", [group_b.user_group_id])
+    vision_upgraded = processor._resolve_harness_model_route(
+        "shared-auto",
+        "thr-allowed",
+        {"model": "zhipu/glm-4"},
+        needs_multimodal=True,
+        user_id=allowed_user,
+    )
+    assert vision_upgraded.model_ref == "zhipu/glm-4v"
+
+    with pytest.raises(OctopError) as denied:
+        processor._resolve_harness_model_route(
+            "shared-auto",
+            "thr-denied",
+            None,
+            needs_multimodal=False,
+            user_id=outsider,
+        )
+    assert denied.value.code == ErrorCode.RESOURCE_NOT_ALLOWED
+
+    ws_msg = InboundMessage(
+        channel_id="web",
+        channel_type="dashboard",
+        tenant_id="shared-auto",
+        channel_subject=ChannelSubject(subject_id=str(outsider)),
+        content=[TextContent(text="hi")],
+        metadata={"session_key": f"web:{outsider}", "thread_id": "thr-ws"},
+    )
+    with pytest.raises(OctopError) as ws_denied:
+        _ = [chunk async for chunk in processor.iter_turn_chunks(ws_msg)]
+    assert ws_denied.value.code == ErrorCode.RESOURCE_NOT_ALLOWED
+
+    im_msg = InboundMessage(
+        channel_id="feishu-1",
+        channel_type="feishu",
+        tenant_id="shared-auto",
+        channel_subject=ChannelSubject(subject_id="ext-outsider"),
+        content=[TextContent(text="hi")],
+        metadata={"user_id": outsider},
+    )
+    with patch(
+        "octop.infra.gateway.process.processor.resolve_user_id_for_message", return_value=outsider
+    ):
+        events = [ev async for ev in processor(im_msg)]
+    assert any(ev.type == "error" and "RESOURCE_NOT_ALLOWED" in str(ev.error) for ev in events)
+    assert events[-1].type == "completed"

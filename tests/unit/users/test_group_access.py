@@ -533,3 +533,88 @@ def test_shared_expert_list_respects_group_grants(repos: RepoBundle) -> None:
     private = repos.agent_repo.get("ex-private")
     assert private is not None
     assert not expert_visible_to(repos, private, user_id=member, is_admin=False)
+
+
+def test_model_grants_match_case_insensitively(repos: RepoBundle) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from octop.infra.users.groups import group_access_by_group, group_visibility_sql
+
+    member = _user(repos, "model-member")
+    outsider = _user(repos, "model-outsider")
+    group = repos.user_group_repo.create(name="model-ops", description=None)
+    other = repos.user_group_repo.create(name="model-other", description=None)
+    repos.user_group_member_repo.add(group.user_group_id, member)
+    repos.provider_repo.create(
+        name="DeepSeek",
+        kind="openai",
+        models_json=json.dumps([{"id": "DeepSeek-Chat", "name": "DeepSeek Chat"}]),
+    )
+    access = GroupAccess(repos)
+    access.set_visibility(RESOURCE_MODEL, "deepseek/deepseek-chat", "groups", [group.user_group_id])
+
+    assert access.allows(
+        user_id=member,
+        is_admin=False,
+        resource_type=RESOURCE_MODEL,
+        resource_key="DeepSeek/DeepSeek-Chat",
+        is_owner=False,
+    )
+    assert not access.allows(
+        user_id=outsider,
+        is_admin=False,
+        resource_type=RESOURCE_MODEL,
+        resource_key="DeepSeek/DeepSeek-Chat",
+        is_owner=False,
+    )
+    assert (
+        model_ref_allowed(
+            repos, user_id=outsider, is_admin=False, model_ref="DeepSeek/DeepSeek-Chat"
+        )
+        is False
+    )
+    assert (
+        model_ref_allowed(repos, user_id=member, is_admin=False, model_ref="DEEPSEEK/DEEPSEEK-CHAT")
+        is True
+    )
+    rows = [SimpleNamespace(ref="DeepSeek/DeepSeek-Chat"), SimpleNamespace(ref="open/model")]
+    assert [
+        row.ref
+        for row in access.filter_rows(
+            rows,
+            user_id=outsider,
+            is_admin=False,
+            resource_type=RESOURCE_MODEL,
+            key_of=lambda r: r.ref,
+            is_owner=lambda _: False,
+        )
+    ] == ["open/model"]
+    assert access.visibility(RESOURCE_MODEL, "DeepSeek/DeepSeek-Chat", shared=None) == {
+        "visibility": "groups",
+        "group_ids": [group.user_group_id],
+    }
+
+    clause = group_visibility_sql(RESOURCE_MODEL, "'DeepSeek/DeepSeek-Chat'")
+    with repos.db.connect() as conn:
+        assert conn.execute(f"SELECT 1 WHERE {clause}", (member,)).fetchone() is not None
+        assert conn.execute(f"SELECT 1 WHERE {clause}", (outsider,)).fetchone() is None
+
+    summaries = group_access_by_group(repos)
+    assert summaries[group.user_group_id]["models"] == [
+        {
+            "key": "DeepSeek/DeepSeek-Chat",
+            "label": "DeepSeek Chat · DeepSeek",
+            "audience": "groups",
+            "missing": False,
+        }
+    ]
+    assert summaries[other.user_group_id]["models"] == []
+
+    access.set_visibility(RESOURCE_MODEL, "DeepSeek/DeepSeek-Chat", "all", [])
+    assert (
+        model_ref_allowed(
+            repos, user_id=outsider, is_admin=False, model_ref="deepseek/deepseek-chat"
+        )
+        is True
+    )

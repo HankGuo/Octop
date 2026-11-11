@@ -298,3 +298,89 @@ async def test_provider_failure_skips_sibling_model(monkeypatch) -> None:
     assert response.result[0].content == "ok"
     assert attempts == ["p/a", "q/c"]
     assert configurable["model"] == "q/c"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_user", "expected_uid"),
+    [
+        (2, 2),
+        ("2", 2),
+        ("feishu:u1", 0),
+    ],
+)
+async def test_failover_skips_candidates_not_allowed_for_user(
+    monkeypatch,
+    raw_user: int | str,
+    expected_uid: int,
+) -> None:
+    models = {
+        "p/a": _model("p/a", 100_000),
+        "p/restricted": _model("p/restricted", 100_000),
+        "q/allowed": _model("q/allowed", 100_000),
+    }
+    seen_uids: list[int] = []
+
+    def is_allowed(uid: int, ref: str) -> bool:
+        seen_uids.append(uid)
+        return ref == "q/allowed"
+
+    configurable = {"model": "p/a", "octop_auto_route": True, "user": raw_user}
+    middleware = SafeModelFailoverMiddleware(
+        health=ModelHealthRegistry(clock=lambda: 100.0),
+        candidates=lambda _current, _vision: [
+            AutoRouteCandidate("p/restricted", 100_000),
+            AutoRouteCandidate("q/allowed", 100_000),
+        ],
+        model_for_ref=models.__getitem__,
+        max_retries=0,
+        initial_delay=0,
+        max_delay=0,
+        is_candidate_allowed=is_allowed,
+    )
+    monkeypatch.setattr(model_failover, "_configurable", lambda _request: configurable)
+    attempts: list[str] = []
+
+    async def handler(request: ModelRequest) -> ModelResponse:
+        attempts.append(request.model.model)
+        if request.model.model == "p/a":
+            raise RuntimeError("HTTP 503 service unavailable")
+        return ModelResponse(result=[AIMessage(content="ok")])
+
+    response = await middleware.awrap_model_call(
+        ModelRequest(model=models["p/a"], messages=[HumanMessage(content="hello")]),
+        handler,
+    )
+
+    assert response.result[0].content == "ok"
+    assert attempts == ["p/a", "q/allowed"]
+    assert seen_uids and all(uid == expected_uid for uid in seen_uids)
+
+
+@pytest.mark.asyncio
+async def test_failover_does_not_try_restricted_candidate_when_all_forbidden(monkeypatch) -> None:
+    models = {
+        "p/a": _model("p/a", 100_000),
+        "p/restricted": _model("p/restricted", 100_000),
+    }
+    configurable = {"model": "p/a", "octop_auto_route": True, "user": 5}
+    middleware = SafeModelFailoverMiddleware(
+        health=ModelHealthRegistry(clock=lambda: 100.0),
+        candidates=lambda _current, _vision: [AutoRouteCandidate("p/restricted", 100_000)],
+        model_for_ref=models.__getitem__,
+        max_retries=0,
+        initial_delay=0,
+        max_delay=0,
+        on_failure="error",
+        is_candidate_allowed=lambda _uid, _ref: False,
+    )
+    monkeypatch.setattr(model_failover, "_configurable", lambda _request: configurable)
+    handler = AsyncMock(side_effect=RuntimeError("HTTP 503 service unavailable"))
+
+    with pytest.raises(RuntimeError):
+        await middleware.awrap_model_call(
+            ModelRequest(model=models["p/a"], messages=[HumanMessage(content="hello")]),
+            handler,
+        )
+
+    assert [call.args[0].model.model for call in handler.call_args_list] == ["p/a"]

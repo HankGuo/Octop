@@ -91,11 +91,35 @@ async def cmd_compact(
         return
 
     # Prefer the model selected in the chat composer for this turn, then a
-    # sticky thread /model override, then settings active / first usable model.
+    # sticky thread /model override, then the first permitted fallback model.
     override = d.get_thread_model_override(ctx, tid)
     if not isinstance(override, str) or not override.strip():
         override = None
-    model_ref = ctx.model_ref or override or ctx.agent_manager.resolve_fallback_model_ref()
+    requested_model = ctx.model_ref or override
+    model_ref = requested_model
+    denied_by_access = False
+    if model_ref and not ctx.agent_manager.model_ref_allowed_for_user(ctx.user_id, model_ref):
+        model_ref = None
+        denied_by_access = True
+    if not model_ref:
+        model_ref = ctx.agent_manager.resolve_fallback_model_ref(user_id=ctx.user_id)
+    if not model_ref:
+        providers = getattr(ctx.agent_manager, "providers", None)
+        candidates = (
+            providers.list_auto_route_candidates(needs_multimodal=False)
+            if providers is not None
+            else None
+        )
+        candidate_list = candidates if isinstance(candidates, list) else []
+        if denied_by_access or (
+            candidate_list
+            and not any(
+                ctx.agent_manager.model_ref_allowed_for_user(ctx.user_id, c.ref)
+                for c in candidate_list
+            )
+        ):
+            await sink.text(tr("model.denied", lang, model=requested_model or "auto"))
+            return
     try:
         result = await compact(tid, model=model_ref)
     except Exception:

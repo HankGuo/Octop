@@ -35,6 +35,21 @@ def _configurable(request: ModelRequest[Any]) -> dict[str, Any]:
     return configurable if isinstance(configurable, dict) else {}
 
 
+def _failover_user_id(configurable: dict[str, Any]) -> int | None:
+    raw = configurable.get("user")
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
 def _estimated_input_tokens(request: ModelRequest[Any]) -> int:
     return sum(breakdown_from_model_request(request).values())
 
@@ -65,12 +80,14 @@ class SafeModelFailoverMiddleware(AgentMiddleware[Any, Any]):
         initial_delay: float,
         max_delay: float,
         on_failure: Callable[[Exception], str] | Literal["error"] | None = None,
+        is_candidate_allowed: Callable[[int, str], bool] | None = None,
     ) -> None:
         super().__init__()
         self._health = health
         self._candidates = candidates
         self._model_for_ref = model_for_ref
         self._on_failure = on_failure
+        self._is_candidate_allowed = is_candidate_allowed
         self._retry = ModelRetryMiddleware(
             max_retries=max_retries,
             initial_delay=initial_delay,
@@ -99,12 +116,19 @@ class SafeModelFailoverMiddleware(AgentMiddleware[Any, Any]):
     def _fallbacks(self, request: ModelRequest[Any], current_ref: str) -> list[AutoRouteCandidate]:
         needs_multimodal = latest_human_needs_multimodal(list(request.messages or []))
         estimated = _estimated_input_tokens(request)
-        raw_route_cap = _configurable(request).get(CONFIGURABLE_MAX_INPUT_TOKENS)
+        configurable = _configurable(request)
+        raw_route_cap = configurable.get(CONFIGURABLE_MAX_INPUT_TOKENS)
         route_cap = raw_route_cap if isinstance(raw_route_cap, int) else None
+        user_id = _failover_user_id(configurable)
         return [
             candidate
             for candidate in self._candidates(current_ref, needs_multimodal)
             if candidate.ref != current_ref
+            and (
+                self._is_candidate_allowed is None
+                or user_id is None
+                or self._is_candidate_allowed(user_id, candidate.ref)
+            )
             and self._health.is_routable(candidate.ref)
             and _fits_context(candidate, estimated, route_cap)
         ]

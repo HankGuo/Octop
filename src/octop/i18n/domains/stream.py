@@ -251,6 +251,10 @@ def format_stream_error(exc: BaseException | str, locale: str | Locale = "en") -
     Tool / path failures (e.g. ``send_file_to_user`` missing file) pass through so
     the UI does not mislabel them as a model-call outage.
     """
+    from octop.infra.errors import OctopError  # noqa: PLC0415
+
+    if isinstance(exc, OctopError):
+        return exc.localized_message(locale)
     current = exc if isinstance(exc, BaseException) else None
     seen: set[int] = set()
     while current is not None and id(current) not in seen:

@@ -2098,14 +2098,47 @@ class AgentManager:
                 return ref
         return self._providers.resolve_first_model_ref()
 
-    def resolve_fallback_model_ref(self) -> str | None:
-        """Return the first healthy model for an automatic route."""
+    def _resolve_fallback_for_owner(self, user_id: int | None) -> str | None:
         configured = self._resolve_configured_fallback_model_ref()
-        if configured and self._model_health.is_routable(configured):
+        if user_id is None:
+            return configured
+        if configured and self.model_ref_allowed_for_user(user_id, configured):
             return configured
         for candidate in self._providers.list_auto_route_candidates(needs_multimodal=False):
-            if self._model_health.is_routable(candidate.ref):
+            if self.model_ref_allowed_for_user(user_id, candidate.ref):
                 return candidate.ref
+        return None
+
+    def resolve_fallback_model_ref(
+        self,
+        *,
+        user_id: int | None = None,
+        needs_multimodal: bool = False,
+    ) -> str | None:
+        """Return the first healthy, user-permitted model for an automatic route."""
+
+        def allowed(ref: str) -> bool:
+            return user_id is None or self.model_ref_allowed_for_user(user_id, ref)
+
+        configured = self._resolve_configured_fallback_model_ref()
+        if (
+            configured
+            and self._model_health.is_routable(configured)
+            and allowed(configured)
+            and (not needs_multimodal or self._providers.is_model_ref_multimodal(configured))
+        ):
+            return configured
+        for candidate in self._providers.list_auto_route_candidates(
+            needs_multimodal=needs_multimodal
+        ):
+            if self._model_health.is_routable(candidate.ref) and allowed(candidate.ref):
+                return candidate.ref
+        if needs_multimodal:
+            if configured and self._model_health.is_routable(configured) and allowed(configured):
+                return configured
+            for candidate in self._providers.list_auto_route_candidates(needs_multimodal=False):
+                if self._model_health.is_routable(candidate.ref) and allowed(candidate.ref):
+                    return candidate.ref
         return None
 
     def is_auto_route_model_available(self, ref: str) -> bool:
@@ -4514,7 +4547,7 @@ class AgentManager:
             # ``resolve_explicit_default_model`` directly.
             default_model=(
                 self._providers.resolve_explicit_default_model(row, cfg)
-                or self._resolve_configured_fallback_model_ref()
+                or self._resolve_fallback_for_owner(row.user_id)
             ),
             system_prompt=system_prompt,
             memory=memory,
@@ -4575,6 +4608,7 @@ class AgentManager:
                     initial_delay=applied.model_retry_initial_delay,
                     max_delay=applied.model_retry_max_delay,
                     on_failure="error",
+                    is_candidate_allowed=self.model_ref_allowed_for_user,
                 )
             else:
                 from langchain.agents.middleware import ModelRetryMiddleware
